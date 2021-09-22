@@ -45,21 +45,21 @@ $runtimes = Config::getParam('runtimes');
 Swoole\Runtime::enableCoroutine(true, SWOOLE_HOOK_ALL ^ SWOOLE_HOOK_CURL);
 
 // Warmup: make sure images are ready to run fast 🚀
-Co\run(function () use ($runtimes, $orchestration) {
-    foreach ($runtimes as $runtime) {
-        go(function () use ($runtime, $orchestration) {
-            Console::info('Warming up ' . $runtime['name'] . ' ' . $runtime['version'] . ' environment...');
+// Co\run(function () use ($runtimes, $orchestration) {
+//     foreach ($runtimes as $runtime) {
+//         go(function () use ($runtime, $orchestration) {
+//             Console::info('Warming up ' . $runtime['name'] . ' ' . $runtime['version'] . ' environment...');
 
-            $response = $orchestration->pull($runtime['image']);
+//             $response = $orchestration->pull($runtime['image']);
 
-            if ($response) {
-                Console::success("Successfully Warmed up {$runtime['name']} {$runtime['version']}!");
-            } else {
-                Console::error("Failed to Warmup {$runtime['name']} {$runtime['version']}!");
-            }
-        });
-    }
-});
+//             if ($response) {
+//                 Console::success("Successfully Warmed up {$runtime['name']} {$runtime['version']}!");
+//             } else {
+//                 Console::error("Failed to Warmup {$runtime['name']} {$runtime['version']}!");
+//             }
+//         });
+//     }
+// });
 
 /**
  * List function servers
@@ -68,10 +68,21 @@ $executionStart = \microtime(true);
 
 $response = $orchestration->list(['label' => 'appwrite-type=function']);
 
-$activeFunctions = [];
+$activeFunctions = new Swoole\Table(1024);
+$activeFunctions->column('id', Swoole\Table::TYPE_STRING, 512);
+$activeFunctions->column('name', Swoole\Table::TYPE_STRING, 512);
+$activeFunctions->column('status', Swoole\Table::TYPE_STRING, 512);
+$activeFunctions->column('private-key', Swoole\Table::TYPE_STRING, 4096);
+$activeFunctions->create();
+
 
 foreach ($response as $value) {
-    $activeFunctions[$value->getName()] = $value;
+    $activeFunctions->set($value->getName(), [
+        'id' => $value->getId(),
+        'name' => $value->getName(),
+        'status' => $value->getStatus(),
+        'private-key' => ''
+    ]);
 }
 
 $executionEnd = \microtime(true);
@@ -501,6 +512,12 @@ function createRuntimeServer(string $functionId, string $projectId, Document $ta
         return;
     }
 
+    // Generate random secret key
+    $privateKey = openssl_pkey_new(array('private_key_bits' => 2048));
+    $details = openssl_pkey_get_details($privateKey);
+    $publicKey = $details['key'];
+    openssl_pkey_export($privateKey, $privateKey); // Turn private key into a string so we can place it into a swoole table
+
     // Check if runtime is active
     $runtime = (isset($runtimes[$function->getAttribute('runtime', '')]))
         ? $runtimes[$function->getAttribute('runtime', '')]
@@ -522,11 +539,12 @@ function createRuntimeServer(string $functionId, string $projectId, Document $ta
         'APPWRITE_FUNCTION_RUNTIME_NAME' => $runtime['name'],
         'APPWRITE_FUNCTION_RUNTIME_VERSION' => $runtime['version'],
         'APPWRITE_FUNCTION_PROJECT_ID' => $projectId,
+        'APPWRITE_INTERNAL_RUNTIME_PUBLIC' => $publicKey,
     ]);
 
     $container = 'appwrite-function-' . $tag->getId();
 
-    if (isset($activeFunctions[$container]) && !(\substr($activeFunctions[$container]->getStatus(), 0, 2) === 'Up')) { // Remove container if not online
+    if ($activeFunctions->exists($container) && !(\substr($activeFunctions->get($container)['status'], 0, 2) === 'Up')) { // Remove container if not online
         // If container is online then stop and remove it
         try {
             $orchestration->remove($container);
@@ -534,7 +552,7 @@ function createRuntimeServer(string $functionId, string $projectId, Document $ta
             Console::warning('Failed to remove container: ' . $e->getMessage());
         }
 
-        unset($activeFunctions[$container]);
+        $activeFunctions->del($container);
     }
 
     // Check if tag is built yet.
@@ -574,7 +592,7 @@ function createRuntimeServer(string $functionId, string $projectId, Document $ta
      * Make sure no access to NFS server / storage volumes
      * Access Appwrite REST from internal network for improved performance
      */
-    if (!isset($activeFunctions[$container])) { // Create contianer if not ready
+    if (!$activeFunctions->exists($container)) { // Create contianer if not ready
         $executionStart = \microtime(true);
         $executionTime = \time();
 
@@ -603,16 +621,12 @@ function createRuntimeServer(string $functionId, string $projectId, Document $ta
 
         $executionEnd = \microtime(true);
 
-        $activeFunctions[$container] = new Container(
-            $container,
-            $id,
-            'Up',
-            [
-                'appwrite-type' => 'function',
-                'appwrite-created' => strval($executionTime),
-                'appwrite-runtime' => $function->getAttribute('runtime', ''),
-            ]
-        );
+        $activeFunctions->set($container, [
+            'id' => $id,
+            'name' => $container,
+            'status' => 'Up ' . \round($executionEnd - $executionStart, 2) . 's',
+            'private-key' => $privateKey,
+        ]);
 
         Console::info('Runtime Server created in ' . ($executionEnd - $executionStart) . ' seconds');
     } else {
@@ -708,9 +722,9 @@ function execute(string $trigger, string $projectId, string $executionId, string
     }
 
     try {
-        if (!isset($activeFunctions[$container])) { // Create contianer if not ready
+        if (!$activeFunctions->exists($container)) { // Create contianer if not ready
             createRuntimeServer($functionId, $projectId, $tag, $database);
-        } else if ($activeFunctions[$container]->getStatus() === 'Down') {
+        } else if ($activeFunctions->get($container)['status'] === 'Down') {
             sleep(1);
         } else {
             Console::info('Container is ready to run');
@@ -727,6 +741,31 @@ function execute(string $trigger, string $projectId, string $executionId, string
         ]));
         Authorization::enable();
     }
+
+    // Generate Signed Challenge
+    $internalFunction = $activeFunctions->get('appwrite-function-' . $tag->getId());
+    $privateKey = openssl_pkey_get_private($internalFunction['private-key']); // Convert PEM formatted key from swoole table into resource
+
+    $signedChallenge = '';
+
+    \openssl_sign($function->getId(), $signedChallenge, $privateKey, OPENSSL_ALGO_SHA256);
+    $signedChallenge = \base64_encode($signedChallenge);
+
+    // Process environment variables
+    $vars = \array_merge($function->getAttribute('vars', []), [
+        'APPWRITE_FUNCTION_ID' => $function->getId(),
+        'APPWRITE_FUNCTION_NAME' => $function->getAttribute('name', ''),
+        'APPWRITE_FUNCTION_TAG' => $tag->getId(),
+        'APPWRITE_FUNCTION_TRIGGER' => $trigger,
+        'APPWRITE_FUNCTION_RUNTIME_NAME' => $runtime['name'],
+        'APPWRITE_FUNCTION_RUNTIME_VERSION' => $runtime['version'],
+        'APPWRITE_FUNCTION_EVENT' => $event,
+        'APPWRITE_FUNCTION_EVENT_DATA' => $eventData,
+        'APPWRITE_FUNCTION_DATA' => $data,
+        'APPWRITE_FUNCTION_USER_ID' => $userId,
+        'APPWRITE_FUNCTION_JWT' => $jwt,
+        'APPWRITE_FUNCTION_PROJECT_ID' => $projectId
+    ]);
 
     $stdout = '';
     $stderr = '';
