@@ -4,7 +4,7 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "0674f59e4259487551f294c7cc8ef1ee",
+    "content-hash": "849ebff38f2baa4647abf7fe874a193f",
     "packages": [
         {
             "name": "adhocore/jwt",
@@ -118,8 +118,8 @@
             "version": "dev-refactor",
             "source": {
                 "type": "git",
-                "url": "https://github.com/appwrite/php-runtimes.git",
-                "reference": "30bf6781acee1e3f32c89821e5706ac6cf7d7c0e"
+                "url": "https://github.com/appwrite/runtimes.git",
+                "reference": "1421ed704f72d14ac137072b583daf3ab882720d"
             },
             "require": {
                 "php": ">=8.0",
@@ -160,7 +160,7 @@
                 "php",
                 "runtimes"
             ],
-            "time": "2022-01-05T13:09:45+00:00"
+            "time": "2022-01-17T09:23:18+00:00"
         },
         {
             "name": "chillerlan/php-qrcode",

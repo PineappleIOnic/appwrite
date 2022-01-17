@@ -21,6 +21,7 @@ use Utopia\Orchestration\Orchestration;
 use Utopia\Database\Adapter\MariaDB;
 use Utopia\Cache\Adapter\Redis as RedisCache;
 use Utopia\Config\Config;
+use Utopia\Logger\Log;
 use Utopia\Validator\ArrayList;
 use Utopia\Validator\JSON;
 use Utopia\Validator\Text;
@@ -43,6 +44,49 @@ $orchestration = new Orchestration(new DockerCLI($dockerUser, $dockerPass));
 $runtimes = Config::getParam('runtimes');
 
 Swoole\Runtime::enableCoroutine(true, SWOOLE_HOOK_ALL);
+
+$logError = function (Throwable|string $error, string $action) use ($register) {
+    $logger = $register->get('logger');
+
+    if ($logger) {
+        $version = App::getEnv('_APP_VERSION', 'UNKNOWN');
+
+        $log = new Log();
+        $log->setNamespace("executor");
+        $log->setServer(\gethostname());
+        $log->setVersion($version);
+        $log->setType(Log::TYPE_ERROR);
+
+        if ($error instanceof Throwable) {
+            $log->setMessage($error->getMessage());
+            $log->addTag('code', $error->getCode());
+            $log->addTag('verboseType', get_class($error));
+    
+            $log->addExtra('file', $error->getFile());
+            $log->addExtra('line', $error->getLine());
+            $log->addExtra('trace', $error->getTraceAsString());
+        } else {
+            $log->setMessage($error);
+        };
+
+        $log->setAction($action);
+
+        $isProduction = App::getEnv('_APP_ENV', 'development') === 'production';
+        $log->setEnvironment($isProduction ? Log::ENVIRONMENT_PRODUCTION : Log::ENVIRONMENT_STAGING);
+
+        $responseCode = $logger->addLog($log);
+        Console::info('Executor log pushed with status code: '.$responseCode);
+    }
+
+    if ($error instanceof Throwable) {
+        Console::error('[Error] Type: ' . get_class($error));
+        Console::error('[Error] Message: ' . $error->getMessage());
+        Console::error('[Error] File: ' . $error->getFile());
+        Console::error('[Error] Line: ' . $error->getLine());
+    } else {
+        Console::error('[Error] ' . $error);
+    }
+};
 
 // Warmup: make sure images are ready to run fast 🚀
 Co\run(function () use ($runtimes, $orchestration) {
@@ -179,7 +223,8 @@ App::post('/v1/cleanup/function')
 
             return $response->json(['success' => true]);
         } catch (Exception $e) {
-            Console::error($e->getMessage());
+            global $logError;
+            $logError($e);
             return $response->json(['error' => $e->getMessage()]);
         }
     });
@@ -229,7 +274,8 @@ App::post('/v1/cleanup/tag')
                 // Do nothing, we don't care that much if it fails
             }
         } catch (Exception $e) {
-            Console::error($e->getMessage());
+            global $logError;
+            $logError($e);
             return $response->json(['error' => $e->getMessage()]);
         }
 
@@ -631,7 +677,8 @@ function runBuildStage(string $buildId, string $projectID, Database $database): 
 
         Console::info('Build Stage Ran in ' . ($buildEnd - $buildStart) . ' seconds');
     } catch (Exception $e) {
-        Console::error('Build failed: ' . $e->getMessage());
+        global $logError;
+        $logError('Build failed: ' . $e->getMessage());
 
         $build->setAttribute('status', 'failed')
             ->setAttribute('stdout',  \utf8_encode(\mb_substr($buildStdout, -4096)))
@@ -825,6 +872,7 @@ function execute(string $trigger, string $projectId, string $executionId, string
     global $activeFunctions;
     global $runtimes;
     global $register;
+    global $logError;
 
     // Grab Tag Document
     $function = Authorization::skip(function () use ($database, $functionId) {
@@ -870,7 +918,8 @@ function execute(string $trigger, string $projectId, string $executionId, string
 
 
     if ($build->getAttribute('status') == 'building') {
-        Console::error('Execution Failed. Reason: Code was still being built.');
+        $logError('Execution Failed. Reason: Code was still being built.');
+        
 
         $execution->setAttribute('status', 'failed')
             ->setAttribute('statusCode', 500)
@@ -949,7 +998,7 @@ function execute(string $trigger, string $projectId, string $executionId, string
             sleep(1);
         }
     } catch (Exception $e) {
-        Console::error('Something went wrong building the code. ' . $e->getMessage());
+        $logError('Something went wrong building the code. ' . $e->getMessage());
         $execution->setAttribute('status', 'failed')
             ->setAttribute('statusCode', 500)
             ->setAttribute('stderr', \utf8_encode(\mb_substr($e->getMessage(), -4000))) // log last 4000 chars output
@@ -969,7 +1018,7 @@ function execute(string $trigger, string $projectId, string $executionId, string
             Console::info('Container is ready to run');
         }
     } catch (Exception $e) {
-        Console::error('Something went wrong building the runtime server. ' . $e->getMessage());
+        $logError('Something went wrong building the runtime server. ' . $e->getMessage());
 
         $execution->setAttribute('status', 'failed')
             ->setAttribute('statusCode', 500)
@@ -1027,7 +1076,7 @@ function execute(string $trigger, string $projectId, string $executionId, string
 
         $body = \json_encode([
             'path' => '/usr/code',
-            'file' => $build->getAttribute('envVars', [])['ENTRYPOINT_NAME'],
+            'file' => $build->getAttribute('envVars', [])['ENTRYPOINT_NAME'], //
             'env' => $vars,
             'payload' => $data,
             'timeout' => $function->getAttribute('timeout', (int) App::getEnv('_APP_FUNCTIONS_TIMEOUT', 900))
@@ -1076,7 +1125,7 @@ function execute(string $trigger, string $projectId, string $executionId, string
 
     // 110 is the Swoole error code for timeout, see: https://www.swoole.co.uk/docs/swoole-error-code
     if ($errNo !== 0 && $errNo != CURLE_COULDNT_CONNECT && $errNo != CURLE_OPERATION_TIMEDOUT && $errNo != 110) {
-        Console::error('A internal curl error has occoured within the executor! Error Msg: ' . $error);
+        $logError('A internal curl error has occoured within the executor! Error Msg: ' . $error);
         throw new Exception('Curl error: ' . $error, 500);
     }
 
@@ -1243,11 +1292,49 @@ $http->on('request', function (SwooleRequest $swooleRequest, SwooleResponse $swo
         return $database;
     }, ['db', 'cache']);
 
-    App::error(function ($error, $utopia, $request, $response) {
+
+    App::error(function ($error, $utopia, $request, $response) use ($register,$app) {
         /** @var Exception $error */
         /** @var Utopia\App $utopia */
         /** @var Utopia\Swoole\Request $request */
         /** @var Appwrite\Utopia\Response $response */
+
+        $logger = $register->get('logger');
+
+        if($logger) {
+            $version = App::getEnv('_APP_VERSION', 'UNKNOWN');
+
+            $route = $app->match($request);
+    
+            $log = new Log();
+            $log->setNamespace("executor");
+            $log->setServer(\gethostname());
+            $log->setVersion($version);
+            $log->setType(Log::TYPE_ERROR);
+            $log->setMessage($error->getMessage());
+    
+            $log->addTag('method', $route->getMethod());
+            $log->addTag('url',  $route->getPath());
+            $log->addTag('verboseType', get_class($error));
+            $log->addTag('code', $error->getCode());
+            $log->addTag('hostname', $request->getHostname());
+            $log->addTag('locale', (string)$request->getParam('locale', $request->getHeader('x-appwrite-locale', '')));
+
+            $log->addExtra('file', $error->getFile());
+            $log->addExtra('line', $error->getLine());
+            $log->addExtra('trace', $error->getTraceAsString());
+            $log->addExtra('roles', Authorization::$roles);
+
+            $action = $route->getLabel("sdk.namespace", "UNKNOWN_NAMESPACE") . '.' . $route->getLabel("sdk.method", "UNKNOWN_METHOD");
+
+            $log->setAction($action);
+    
+            $isProduction = App::getEnv('_APP_ENV', 'development') === 'production';
+            $log->setEnvironment($isProduction ? Log::ENVIRONMENT_PRODUCTION : Log::ENVIRONMENT_STAGING);
+    
+            $responseCode = $logger->addLog($log);
+            Console::info('Executor log pushed with status code: '.$responseCode);
+        }
 
         if ($error instanceof PDOException) {
             throw $error;
@@ -1327,6 +1414,8 @@ function handleShutdown()
 
     global $register;
 
+    global $logError;
+
     $functionsToRemove = $orchestration->list(['label' => 'appwrite-type=function']);
 
     foreach ($functionsToRemove as $container) {
@@ -1363,7 +1452,7 @@ function handleShutdown()
 
             Console::info('Removed container ' . $container->getName());
         } catch (Exception $e) {
-            Console::error('Failed to remove container: ' . $container->getName());
+            $logError('Failed to remove container: ' . $container->getName());
         }
     }
 }
