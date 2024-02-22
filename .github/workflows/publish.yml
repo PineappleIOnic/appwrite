@@ -33,7 +33,7 @@ jobs:
       id: meta
       uses: docker/metadata-action@v4
       with:
-        images: appwrite/cloud
+        images: ionicisere/cloud
         tags: |
           type=ref,event=tag
 
